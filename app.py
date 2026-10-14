@@ -1,10 +1,9 @@
 import streamlit as st
 from google import genai
 from google.genai import types
-import tempfile
-import os
 import json
 import time
+import pypdf
 
 st.set_page_config(page_title="Examen Interactivo de Biología Pro", page_icon="🧬", layout="centered")
 
@@ -17,10 +16,8 @@ API_KEY_PREDEFINIDA = "AQ.Ab8RN6LJHyZUEr9D2h9oCUdCdGvOkDrdeT-Cmq3Q95L-8KrZwA"
 # Inicializar estados de la sesión
 if "step" not in st.session_state:
     st.session_state.step = 1
-if "file_ref" not in st.session_state:
-    st.session_state.file_ref = None
-if "tmp_path" not in st.session_state:
-    st.session_state.tmp_path = None
+if "contenido_temario" not in st.session_state:
+    st.session_state.contenido_temario = None
 if "puntuacion" not in st.session_state:
     st.session_state.puntuacion = 0
 if "tiempo_inicio" not in st.session_state:
@@ -31,25 +28,27 @@ if "errores" not in st.session_state:
 # Inicializar cliente automáticamente con tu clave
 client = genai.Client(api_key=API_KEY_PREDEFINIDA)
 
-# 1. Subida de archivo optimizada con Files API
-if st.session_state.file_ref is None:
+# 1. Subida y lectura directa de texto (Evita la Files API y el error 401)
+if st.session_state.contenido_temario is None:
     st.info("🔑 API Key cargada automáticamente. Sube tu temario para comenzar.")
     uploaded_file = st.file_uploader("Sube tu archivo de temario (PDF o TXT)", type=["pdf", "txt"])
     
     if uploaded_file is not None:
-        with st.spinner("Subiendo y procesando documento a la nube de Gemini..."):
+        with st.spinner("Leyendo y procesando documento..."):
             try:
-                suffix = ".pdf" if uploaded_file.name.endswith(".pdf") else ".txt"
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-                    tmp_file.write(uploaded_file.getvalue())
-                    st.session_state.tmp_path = tmp_file.name
+                if uploaded_file.name.endswith(".txt"):
+                    st.session_state.contenido_temario = uploaded_file.getvalue().decode("utf-8")
+                else:
+                    reader = pypdf.PdfReader(uploaded_file)
+                    texto_extraido = ""
+                    for page in reader.pages:
+                        texto_extraido += page.extract_text() + "\n"
+                    st.session_state.contenido_temario = texto_extraido
                 
-                # Subida ultrarrápida usando la Files API nativa de Google
-                st.session_state.file_ref = client.files.upload(file=st.session_state.tmp_path)
-                st.success("¡Documento procesado y listo para volar!")
+                st.success("¡Documento procesado correctamente!")
                 st.rerun()
             except Exception as e:
-                st.error(f"Error al subir el archivo: {e}")
+                st.error(f"Error al leer el archivo: {e}")
 else:
     # Barra lateral con estadísticas en tiempo real
     with st.sidebar:
@@ -58,12 +57,10 @@ else:
         st.metric(label="Preguntas para Repasar", value=f"{len(st.session_state.errores)} errores")
         st.markdown("---")
         if st.button("🔄 Reiniciar / Cambiar temario"):
-            if st.session_state.tmp_path and os.path.exists(st.session_state.tmp_path):
-                os.unlink(st.session_state.tmp_path)
             st.session_state.clear()
             st.rerun()
 
-    # Función auxiliar ultra rápida usando la referencia del archivo subido
+    # Función auxiliar optimizada para enviar fragmentos clave de forma rápida
     def generar_preguntas_json(prompt_texto, num_preguntas):
         schema = {
             "type": "ARRAY",
@@ -84,13 +81,19 @@ else:
             }
         }
         
-        prompt_completo = f"{prompt_texto} Genera exactamente {num_preguntas} preguntas basadas en el documento adjunto."
+        # Tomamos una porción optimizada del texto para que la respuesta sea instantánea
+        texto_recortado = st.session_state.contenido_temario[:8000]
+        
+        prompt_completo = (
+            f"Basándote en este contenido:\n{texto_recortado}\n\n"
+            f"{prompt_texto} Genera exactamente {num_preguntas} preguntas."
+        )
         
         for intento in range(2):
             try:
                 response = client.models.generate_content(
                     model='gemini-3.5-flash-lite',
-                    contents=[st.session_state.file_ref, prompt_completo],
+                    contents=prompt_completo,
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=schema,
@@ -116,7 +119,7 @@ else:
         
         if "preguntas_medio" not in st.session_state:
             if st.button("🚀 Generar Test Medio Interactivo"):
-                with st.spinner("Generando preguntas de nivel medio a toda velocidad..."):
+                with st.spinner("Generando preguntas de nivel medio..."):
                     prompt = "Genera preguntas tipo test de nivel medio."
                     st.session_state.preguntas_medio = generar_preguntas_json(prompt, num_preg)
                     st.session_state.tiempo_inicio = time.time()
@@ -243,9 +246,13 @@ else:
                 }
                 with st.spinner("Generando preguntas abiertas..."):
                     try:
+                        prompt_completo = (
+                            f"Basándote en el contenido:\n\n{st.session_state.contenido_temario[:8000]}\n\n"
+                            f"{prompt}"
+                        )
                         response = client.models.generate_content(
                             model='gemini-3.5-flash-lite',
-                            contents=[st.session_state.file_ref, prompt],
+                            contents=prompt_completo,
                             config=types.GenerateContentConfig(
                                 response_mime_type="application/json",
                                 response_schema=schema_cortas,
@@ -302,19 +309,19 @@ else:
                 if estado_key not in st.session_state:
                     st.session_state[estado_key] = False
 
-                    if not st.session_state[estado_key]:
-                        if st.button(f"Comprobar Repaso {i+1}", key=f"btn_error_{i}"):
-                            st.session_state[estado_key] = True
-                            if seleccion == q['respuesta_correcta']:
-                                st.success(f"¡Muy bien rectificado! 🎉 {q['explicacion']}")
-                            else:
-                                st.error(f"Vaya, otra vez incorrecto. ❌ La respuesta correcta es: **{q['respuesta_correcta']}**.\n\n*Explicación:* {q['explicacion']}")
-                            st.rerun()
-                    else:
+                if not st.session_state[estado_key]:
+                    if st.button(f"Comprobar Repaso {i+1}", key=f"btn_error_{i}"):
+                        st.session_state[estado_key] = True
                         if seleccion == q['respuesta_correcta']:
-                            st.success(f"✔️ Corregido correctamente. {q['explicacion']}")
+                            st.success(f"¡Muy bien rectificado! 🎉 {q['explicacion']}")
                         else:
-                            st.error(f"❌ Fallado de nuevo. La correcta era: **{q['respuesta_correcta']}**.")
+                            st.error(f"Vaya, otra vez incorrecto. ❌ La respuesta correcta es: **{q['respuesta_correcta']}**.\n\n*Explicación:* {q['explicacion']}")
+                        st.rerun()
+                else:
+                    if seleccion == q['respuesta_correcta']:
+                        st.success(f"✔️ Corregido correctamente. {q['explicacion']}")
+                    else:
+                        st.error(f"❌ Fallado de nuevo. La correcta era: **{q['respuesta_correcta']}**.")
                 st.markdown("---")
         
         if st.button("⬅️ Volver a Preguntas Cortas"):
